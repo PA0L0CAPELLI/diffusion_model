@@ -1,0 +1,18 @@
+# Trained model checkpoints (large, regenerable by re-running training)
+*.mat
+
+# Raw dataset files (don't commit datasets to git; document how to get them in README instead)
+mnist_png/
+mnist_idx/
+*.idx*-ubyte
+*.idx*-ubyte.gz
+
+# MATLAB autosave / temp files
+*.asv
+*.m~
+slprj/
+*.autosave
+
+# OS junk
+.DS_Store
+Thumbs.db
