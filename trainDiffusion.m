@@ -1,111 +1,153 @@
-%% Load Data
-imds = loadDatastore("idx","/Users/paolocapelli/Desktop/MNIST");
-imgSize = [32 32];
-audsImds = augmentedImageDatastore(imgSize, imds);
-%% Forward Diffusion Process
+%% Class-conditional diffusion su LSC (CLL / FL / MCL) - training
+% Prima di tutto:  prepareLSCDataset("/percorso/LSC")   -> crea LSCPatches.mat
+% Per un test rapido: numIterations = 20 e controlla il tempo/iterazione.
+
+%% Configurazione
+dataFile      = "LSCPatches.mat";
+imageSize     = 64;                 % deve coincidere con OutputSize di prepareLSCDataset
+numClasses    = 3;
+baseChannels  = 32;                 % 64 = ~3.5x piu' lento (vedi SecPerIter)
 numNoiseSteps = 500;
-betaMin = 0.0001;
-betaMax = 0.02;
-varianceSchedule = linspace(betaMin, betaMax, numNoiseSteps);
+% Schedule coseno (Nichol & Dhariwal): usa meglio i passi rispetto al lineare,
+% che a 64x64 porta a rumore quasi puro gia' per t > ~250.
+cosS = 0.008;
+tt_ = (0:numNoiseSteps)/numNoiseSteps;
+f_ = cos((tt_ + cosS)/(1 + cosS) * pi/2).^2;
+abar_ = f_/f_(1);
+varianceSchedule = min(1 - abar_(2:end)./abar_(1:end-1), 0.999);
 
-% Sanity-check the forward process on one training image.
-img = read(audsImds);
-img = img{1,1};
-img = img{:};
-img = rescale(img, -1, 1);
+miniBatchSize = 16;
+numIterations = 20000;
+learnRate     = 2e-4;
+pUncond       = 0.1;                % prob. di azzerare la classe (classifier-free guidance)
+emaDecay      = 0.999;
+evalEvery     = 500;                % loss su test (casi mai visti)
+sampleEvery   = 5000;               % campionamento di controllo (lento su CPU)
+checkpointEvery = 1000;
+guidanceScale = 1;
+resume        = false;
 
-figure
-tiledlayout("flow");
-nexttile
-imshow(img, [])
-title("t = 0");
-for i = 1:5
+%% Dati (uint8 in memoria, conversione per batch)
+D = load(dataFile);
+XTrain = D.XTrain; YTrain = D.YTrain; XTest = D.XTest; YTest = D.YTest;
+classNames = D.classNames;
+N = size(XTrain, 4);
+fprintf("Train: %d patch | Test: %d patch\n", N, size(XTest,4));
+assert(size(XTrain,1) == imageSize, "imageSize diverso dalla risoluzione dei patch salvati.");
+
+%% Sanity check del processo forward
+alphaBar = cumprod(1 - varianceSchedule);
+fprintf("alphaBar(T) = %.2e (deve essere ~0)\n", alphaBar(end));
+x0 = single(XTrain(:,:,:,1))/127.5 - 1;
+figure; tiledlayout("flow");
+nexttile; imshow((x0+1)/2); title("t = 0");
+for tShow = [50 150 300 500]
     nexttile
-    noise = randn(size(img), like=img);
-    noiseStepsToApply = numNoiseSteps/5 * i;
-    noisyImg = applyNoiseToImage(img, noise, noiseStepsToApply, varianceSchedule);
-    noisyImg = extractdata(noisyImg);
-    imshow(noisyImg, [])
-    title("t = " + string(noiseStepsToApply));
+    xt = applyNoiseToImage(x0, randn(size(x0),"single"), tShow, varianceSchedule);
+    imshow(min(max((extractdata(xt)+1)/2,0),1)); title("t = " + tShow);
 end
+drawnow
 
-%% Define Network
-numInputChannels = 1;
-net = createDiffusionNetwork(numInputChannels);
-disp(net)
-
-%% Specify Training Options
-miniBatchSize = 128;
-numEpochs = 50;
-
-learnRate = 0.0005;
-gradientDecayFactor = 0.9;
-squaredGradientDecayFactor = 0.9999;
-
-%% Train Model
-doTraining = true;   % set false once you have a saved net to reload
-
-mbq = minibatchqueue(audsImds, 1, ...
-    MiniBatchSize=miniBatchSize, ...
-    MiniBatchFcn=@preprocessMiniBatch, ...
-    MiniBatchFormat="SSCB", ...
-    PartialMiniBatch="discard");
-
-averageGrad = [];
-averageSqGrad = [];
-
-numObservationsTrain = numel(imds.Files);
-numIterationsPerEpoch = ceil(numObservationsTrain/miniBatchSize);
-numIterations = numEpochs*numIterationsPerEpoch;
-
-if doTraining
-    monitor = trainingProgressMonitor(...
-        Metrics="Loss", ...
-        Info=["Epoch","Iteration"], ...
-        XLabel="Iteration");
-
-    iteration = 0;
-    epoch = 0;
-
-    while epoch < numEpochs && ~monitor.Stop
-        epoch = epoch + 1;
-        shuffle(mbq);
-
-        while hasdata(mbq) && ~monitor.Stop
-            iteration = iteration + 1;
-
-            img = next(mbq);
-
-            targetNoise = randn(size(img), Like=img);
-            noiseStep = dlarray(randi(numNoiseSteps,[1 miniBatchSize],Like=img), "CB");
-            noisyImage = applyNoiseToImage(img, targetNoise, noiseStep, varianceSchedule);
-
-            [loss, gradients, state] = dlfeval(@modelLoss, net, noisyImage, noiseStep, targetNoise);
-            net.State = state;
-            gradients = dlupdate(@(g) max(min(g, 1), -1), gradients);
-
-            [net, averageGrad, averageSqGrad] = adamupdate(net, gradients, averageGrad, averageSqGrad, iteration, ...
-                learnRate, gradientDecayFactor, squaredGradientDecayFactor);
-
-            recordMetrics(monitor, iteration, Loss=loss);
-            updateInfo(monitor, Epoch=epoch, Iteration=iteration);
-            monitor.Progress = 100 * iteration/numIterations;
-        end
-
-        % Preview generated digits at the end of each epoch
-        numImages = 16;
-        displayFrequency = numNoiseSteps + 1;   % only show the final result
-        generateAndDisplayImages(net, varianceSchedule, imgSize, numImages, numInputChannels, displayFrequency);
-
-        save("diffusionMnistCheckpoint.mat", "net", "varianceSchedule", "-v7.3");
-        pause(0.1);
-    end
+%% Rete
+if resume && isfile("diffusionLSCCheckpoint.mat")
+    C = load("diffusionLSCCheckpoint.mat");
+    net = C.net; netEMA = C.netEMA; iteration = C.iteration;
 else
-    load("diffusionMnistCheckpoint.mat", "net", "varianceSchedule");
+    net = createDiffusionNetwork(imageSize, numClasses, baseChannels);
+    netEMA = net; iteration = 0;
+end
+fprintf("Parametri apprendibili: %.2f M\n", sum(cellfun(@numel, net.Learnables.Value))/1e6);
+
+%% Training
+avgG = []; avgSqG = [];
+monitor = trainingProgressMonitor(Metrics=["Loss","TestLoss"], ...
+    Info=["Iteration","SecPerIter"], XLabel="Iteration");
+perm = randperm(N); pos = 1;
+tStart = tic;
+
+while iteration < numIterations && ~monitor.Stop
+    iteration = iteration + 1;
+
+    if pos + miniBatchSize - 1 > N
+        perm = randperm(N); pos = 1;
+    end
+    idx = perm(pos:pos+miniBatchSize-1); pos = pos + miniBatchSize;
+
+    batch  = augmentBatch(single(XTrain(:,:,:,idx))/127.5 - 1);
+    labels = double(YTrain(idx))';
+    labels(rand(1, miniBatchSize) < pUncond) = numClasses + 1;   % etichetta nulla
+
+    X0    = dlarray(batch, "SSCB");
+    noise = dlarray(randn(size(batch), "single"), "SSCB");
+    t     = randi(numNoiseSteps, [1 miniBatchSize]);
+    Xt    = applyNoiseToImage(X0, noise, t, varianceSchedule);
+
+    tDL = dlarray(single(t), "CB");
+    cDL = dlarray(single(labels), "CB");
+
+    [loss, grads] = dlfeval(@modelLoss, net, Xt, tDL, cDL, noise);
+    [net, avgG, avgSqG] = adamupdate(net, grads, avgG, avgSqG, iteration, ...
+        learnRate, 0.9, 0.999);
+
+    % EMA dei pesi (usata per il campionamento)
+    d = min(emaDecay, (1 + iteration)/(10 + iteration));
+    netEMA.Learnables.Value = cellfun(@(e,w) d*e + (1-d)*w, ...
+        netEMA.Learnables.Value, net.Learnables.Value, UniformOutput=false);
+
+    recordMetrics(monitor, iteration, Loss=double(extractdata(loss)));
+    updateInfo(monitor, Iteration=iteration, SecPerIter=round(toc(tStart)/(iteration),2));
+    monitor.Progress = 100*iteration/numIterations;
+
+    if mod(iteration, evalEvery) == 0
+        recordMetrics(monitor, iteration, TestLoss=evaluateTestLoss(net, XTest, YTest, ...
+            numClasses, varianceSchedule, 64));
+    end
+    if mod(iteration, sampleEvery) == 0
+        showSamples(netEMA, varianceSchedule, imageSize, numClasses, classNames, 3, guidanceScale);
+    end
+    if mod(iteration, checkpointEvery) == 0
+        save("diffusionLSCCheckpoint.mat", "net", "netEMA", "varianceSchedule", ...
+            "iteration", "classNames", "imageSize", "numClasses", "-v7.3");
+    end
+end
+save("diffusionLSCCheckpoint.mat", "net", "netEMA", "varianceSchedule", ...
+    "iteration", "classNames", "imageSize", "numClasses", "-v7.3");
+
+%% Generazione finale: 8 immagini per classe
+showSamples(netEMA, varianceSchedule, imageSize, numClasses, classNames, 8, guidanceScale);
+
+%% ------------------------- funzioni locali -------------------------
+function batch = augmentBatch(batch)
+% Augmentation spaziale: gruppo diedrale (4 rotazioni x flip). Valida per
+% l'istologia, che non ha orientamento canonico. Nessuna augmentation di
+% colore: la colorazione e' gia' normalizzata (Macenko).
+for i = 1:size(batch, 4)
+    p = rot90(batch(:,:,:,i), randi(4) - 1);
+    if rand < 0.5, p = flip(p, 2); end
+    batch(:,:,:,i) = p;
+end
 end
 
-%% Generate New Images
-numImages = 9;
-displayFrequency = 10;
-figure
-generatedImages = generateAndDisplayImages(net, varianceSchedule, imgSize, numImages, numInputChannels, displayFrequency);
+function l = evaluateTestLoss(net, XTest, YTest, numClasses, varianceSchedule, n)
+% MSE sul rumore su patch di casi MAI visti in training (spia di overfitting).
+n = min(n, size(XTest, 4));
+idx = randperm(size(XTest, 4), n);
+X = single(XTest(:,:,:,idx))/127.5 - 1;
+noise = randn(size(X), "single");
+t = randi(numel(varianceSchedule), [1 n]);
+Xt = applyNoiseToImage(X, noise, t, varianceSchedule);
+pred = predict(net, Xt, dlarray(single(t), "CB"), ...
+    dlarray(single(double(YTest(idx))'), "CB"));
+l = double(extractdata(mean((pred - dlarray(noise, "SSCB")).^2, "all")));
+end
+
+function showSamples(net, varianceSchedule, imageSize, numClasses, classNames, nPer, w)
+classIdx = repelem(1:numClasses, nPer);
+imgs = generateConditionalImages(net, varianceSchedule, imageSize, classIdx, numClasses, w);
+figure; tiledlayout(numClasses, nPer, TileSpacing="none", Padding="compact");
+for k = 1:numel(classIdx)
+    nexttile; imshow(imgs(:,:,:,k));
+    if mod(k-1, nPer) == 0, ylabel(classNames(classIdx(k))); end
+end
+drawnow
+end
