@@ -49,5 +49,5 @@ for t = T:-1:1
     end
     trace(t, :) = [std(x(:)), max(abs(x(:)))];
 end
-images = (min(max(x, -1), 1) + 1) / 2;
+images = toImageRange(x);
 end

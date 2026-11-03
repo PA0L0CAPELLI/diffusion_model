@@ -1,12 +1,13 @@
 %% Diagnostica del campionamento (usa il checkpoint gia' addestrato, nessun retraining)
-C = load("diffusionLSCCheckpoint.mat");
-D = load("LSCPatches.mat", "XTest", "YTest", "classNames");
+P = projectPaths();
+C = load(P.checkpoint);
+D = load(P.patches, "XTest", "YTest", "classNames");
 vs = C.varianceSchedule; T = numel(vs); ab = cumprod(1 - vs);
 nets = {C.net, C.netEMA}; netNames = ["raw", "EMA"];
 
 n = 48;
 idx = randperm(size(D.XTest, 4), n);
-X0 = single(D.XTest(:,:,:,idx))/127.5 - 1;
+X0 = toModelRange(D.XTest(:,:,:,idx));
 y  = dlarray(single(double(D.YTest(idx))'), "CB");
 
 %% 1) Errore di predizione del rumore per t (baseline "predico 0" = 1.0)
@@ -22,6 +23,8 @@ for k = 1:numel(ts)
     end
 end
 disp(array2table(res, VariableNames=netNames, RowNames=string(ts)))
+if ~isfolder(P.results), mkdir(P.results); end
+writetable(array2table([ts(:) res], VariableNames=["t" netNames]), fullfile(P.results, "noise_mse.csv"));
 
 %% 2) Ricostruzione a un passo di x0 (rete EMA): originale / rumoroso / stima
 for tShow = [50 200]
@@ -39,7 +42,7 @@ for tShow = [50 200]
                 case 2, im = extractdata(Xt(:,:,:,k));
                 case 3, im = x0hat(:,:,:,k);
             end
-            imshow(min(max((im + 1)/2, 0), 1))
+            imshow(toImageRange(im))
         end
     end
 end

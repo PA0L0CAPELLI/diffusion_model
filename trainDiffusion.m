@@ -1,9 +1,11 @@
 %% Class-conditional diffusion su LSC (CLL / FL / MCL) - training
-% Prima di tutto:  prepareLSCDataset("/percorso/LSC")   -> crea LSCPatches.mat
+% Prima di tutto:  P = projectPaths(); prepareLSCDataset(fullfile(P.data, "LSC"))  -> crea data/LSCPatches.mat
 % Per un test rapido: numIterations = 20 e controlla il tempo/iterazione.
 
 %% Configurazione
-dataFile      = "LSCPatches.mat";
+P             = projectPaths();
+dataFile      = P.patches;          % data/LSCPatches.mat
+ckptFile      = P.checkpoint;       % checkpoints/diffusionLSCCheckpoint.mat
 imageSize     = 64;                 % deve coincidere con OutputSize di prepareLSCDataset
 numClasses    = 3;
 baseChannels  = 32;                 % 64 = ~3.5x piu' lento (vedi SecPerIter)
@@ -31,6 +33,7 @@ resume        = false;
 D = load(dataFile);
 XTrain = D.XTrain; YTrain = D.YTrain; XTest = D.XTest; YTest = D.YTest;
 classNames = D.classNames;
+assert(numel(classNames) == numClasses, "numClasses diverso dal numero di classi nei dati.");
 N = size(XTrain, 4);
 fprintf("Train: %d patch | Test: %d patch\n", N, size(XTest,4));
 assert(size(XTrain,1) == imageSize, "imageSize diverso dalla risoluzione dei patch salvati.");
@@ -38,19 +41,19 @@ assert(size(XTrain,1) == imageSize, "imageSize diverso dalla risoluzione dei pat
 %% Sanity check del processo forward
 alphaBar = cumprod(1 - varianceSchedule);
 fprintf("alphaBar(T) = %.2e (deve essere ~0)\n", alphaBar(end));
-x0 = single(XTrain(:,:,:,1))/127.5 - 1;
+x0 = toModelRange(XTrain(:,:,:,1));
 figure; tiledlayout("flow");
 nexttile; imshow((x0+1)/2); title("t = 0");
 for tShow = [50 150 300 500]
     nexttile
     xt = applyNoiseToImage(x0, randn(size(x0),"single"), tShow, varianceSchedule);
-    imshow(min(max((extractdata(xt)+1)/2,0),1)); title("t = " + tShow);
+    imshow(toImageRange(extractdata(xt))); title("t = " + tShow);
 end
 drawnow
 
 %% Rete
-if resume && isfile("diffusionLSCCheckpoint.mat")
-    C = load("diffusionLSCCheckpoint.mat");
+if resume && isfile(ckptFile)
+    C = load(ckptFile);
     net = C.net; netEMA = C.netEMA; iteration = C.iteration;
 else
     net = createDiffusionNetwork(imageSize, numClasses, baseChannels);
@@ -73,7 +76,7 @@ while iteration < numIterations && ~monitor.Stop
     end
     idx = perm(pos:pos+miniBatchSize-1); pos = pos + miniBatchSize;
 
-    batch  = augmentBatch(single(XTrain(:,:,:,idx))/127.5 - 1);
+    batch  = augmentBatch(toModelRange(XTrain(:,:,:,idx)));
     labels = double(YTrain(idx))';
     labels(rand(1, miniBatchSize) < pUncond) = numClasses + 1;   % etichetta nulla
 
@@ -106,12 +109,10 @@ while iteration < numIterations && ~monitor.Stop
         showSamples(netEMA, varianceSchedule, imageSize, numClasses, classNames, 3, guidanceScale);
     end
     if mod(iteration, checkpointEvery) == 0
-        save("diffusionLSCCheckpoint.mat", "net", "netEMA", "varianceSchedule", ...
-            "iteration", "classNames", "imageSize", "numClasses", "-v7.3");
+        saveCheckpoint(ckptFile, net, netEMA, varianceSchedule, iteration, classNames, imageSize, numClasses);
     end
 end
-save("diffusionLSCCheckpoint.mat", "net", "netEMA", "varianceSchedule", ...
-    "iteration", "classNames", "imageSize", "numClasses", "-v7.3");
+saveCheckpoint(ckptFile, net, netEMA, varianceSchedule, iteration, classNames, imageSize, numClasses);
 
 %% Generazione finale: 8 immagini per classe
 showSamples(netEMA, varianceSchedule, imageSize, numClasses, classNames, 8, guidanceScale);
@@ -132,13 +133,19 @@ function l = evaluateTestLoss(net, XTest, YTest, numClasses, varianceSchedule, n
 % MSE sul rumore su patch di casi MAI visti in training (spia di overfitting).
 n = min(n, size(XTest, 4));
 idx = randperm(size(XTest, 4), n);
-X = single(XTest(:,:,:,idx))/127.5 - 1;
+X = toModelRange(XTest(:,:,:,idx));
 noise = randn(size(X), "single");
 t = randi(numel(varianceSchedule), [1 n]);
 Xt = applyNoiseToImage(X, noise, t, varianceSchedule);
 pred = predict(net, Xt, dlarray(single(t), "CB"), ...
     dlarray(single(double(YTest(idx))'), "CB"));
 l = double(extractdata(mean((pred - dlarray(noise, "SSCB")).^2, "all")));
+end
+
+function saveCheckpoint(file, net, netEMA, varianceSchedule, iteration, classNames, imageSize, numClasses) %#ok<INUSD>
+% Salva tutto il necessario per riprendere il training o generare immagini.
+save(file, "net", "netEMA", "varianceSchedule", "iteration", "classNames", ...
+    "imageSize", "numClasses", "-v7.3");
 end
 
 function showSamples(net, varianceSchedule, imageSize, numClasses, classNames, nPer, w)

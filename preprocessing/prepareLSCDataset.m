@@ -1,18 +1,18 @@
 function prepareLSCDataset(rootFolder, opts)
-%PREPAREDATASET  Prepara il dataset LSC (CLL / FL / MCL) per la diffusione.
+%PREPARELSCDATASET  Prepara il dataset LSC (CLL / FL / MCL) per la diffusione.
 %
-%   prepareLSCDataset("/path/LSC")
+%   paths = projectPaths(); prepareLSCDataset(fullfile(paths.data, "LSC"))
 %   prepareLSCDataset("/path/LSC", PatchSize=128, OutputSize=64, ...)
 %
 % Passi:
-%   1. legge le immagini (sottocartelle CLL, FL, MCL = etichette);
+%   1. legge le immagini (una sottocartella per classe, es. CLL, FL, MCL);
 %   2. ricava l'ID del caso/paziente dal nome file;
 %   3. split train/test STRATIFICATO PER CLASSE e a livello di caso
 %      (nessun caso compare in entrambi gli insiemi);
 %   4. normalizza la colorazione (Macenko) sull'immagine intera;
 %   5. estrae patch quadrate a griglia (PatchSize px nativi, passo Stride),
 %      scarta quelle senza tessuto e le ridimensiona a OutputSize;
-%   6. salva tutto in LSCPatches.mat (uint8).
+%   6. salva tutto in data/LSCPatches.mat (uint8).
 arguments
     rootFolder (1,1) string
     opts.PatchSize (1,1) double = 128        % lato del ritaglio in pixel nativi
@@ -22,16 +22,20 @@ arguments
     opts.Seed (1,1) double = 42
     opts.StainNormalize (1,1) logical = true
     opts.MinTissueFraction (1,1) double = 0.5
-    opts.OutFile (1,1) string = "LSCPatches.mat"
+    opts.OutFile (1,1) string = ""            % vuoto = data/LSCPatches.mat
+end
+if opts.OutFile == ""
+    paths = projectPaths();
+    opts.OutFile = paths.patches;
 end
 
-classNames = ["CLL", "FL", "MCL"];
 imds = imageDatastore(rootFolder, IncludeSubfolders=true, LabelSource="foldernames", ...
     FileExtensions=[".jpg",".jpeg",".png",".tif",".tiff"]);
 files = string(imds.Files);
-labels = categorical(string(imds.Labels), classNames);
-assert(~any(isundefined(labels)), "Trovate cartelle diverse da CLL/FL/MCL in %s", rootFolder);
+labels = removecats(imds.Labels);            % classi = nomi delle sottocartelle
+classNames = string(categories(labels))';   % ordine alfabetico: CLL, FL, MCL
 classIdx = double(labels);                   % 1=CLL 2=FL 3=MCL
+fprintf("Classi trovate: %s\n", strjoin(classNames, ", "));
 
 %% ID del caso (paziente)
 caseIDs = extractCaseID(files);
